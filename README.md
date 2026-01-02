@@ -1,4 +1,4 @@
-## ASL_Sign_Language_To_Speech_Translator (Hand Gesture Recognition)
+## SgSL_Sign_Language_To_Speech_Translator (Hand Gesture Recognition)
 
 # Project Description
 This project focuses on recognizing American Sign Language (ASL) hand gestures using Convolutional Neural Networks (CNNs). The project leverages a dataset of skeletal hand images representing the ASL alphabet (A to Z) to train and evaluate a deep learning model for accurate gesture recognition.
