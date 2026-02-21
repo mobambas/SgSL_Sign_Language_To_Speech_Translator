@@ -10,6 +10,7 @@ import os
 import threading
 import time
 import traceback
+from collections import deque
 from string import ascii_uppercase
 from typing import List
 
@@ -18,7 +19,7 @@ import numpy as np
 import tkinter as tk
 from PIL import Image, ImageTk
 
-# Optional imports with graceful fallback
+#fallback
 try:
     import enchant
     ENCHANT_AVAILABLE = True
@@ -41,6 +42,13 @@ except ImportError:
     print("Error: cvzone not available. Hand detection will not work.")
 
 try:
+    from cvzone.FaceMeshModule import FaceMeshDetector
+    FACEMESH_AVAILABLE = True
+except ImportError:
+    FACEMESH_AVAILABLE = False
+    print("Warning: cvzone FaceMesh not available. Non-manual markers disabled.")
+
+try:
     from keras.models import load_model
     KERAS_AVAILABLE = True
 except ImportError:
@@ -57,6 +65,23 @@ WHITE_BG_SIZE = 400
 # Timing configuration
 COOLDOWN_FRAMES = 30  # Frames to wait after adding a character (~1 second at 30fps)
 STABLE_COUNT_REQUIRED = 3  # Consecutive same predictions needed
+
+# Hand detection configuration
+HAND_DETECTION_CONFIDENCE = 0.6
+HAND_TRACKING_CONFIDENCE = 0.5
+
+# Non-manual marker (NMM) configuration
+NMM_STABLE_FRAMES = 4
+NMM_MISSING_RESET = 6
+NMM_BROW_RAISE_DELTA = 0.18
+NMM_BROW_FURROW_DELTA = 0.12
+NMM_BROW_BASELINE_TOL = 0.08
+NMM_MOUTH_OPEN_RATIO = 0.25
+HEAD_MOVEMENT_WINDOW = 12
+HEAD_SHAKE_THRESHOLD = 0.08
+HEAD_NOD_THRESHOLD = 0.08
+HEAD_EVENT_COOLDOWN = 20
+HEAD_TILT_DEG = 12
 
 
 def distance(p1, p2):
@@ -406,6 +431,125 @@ class HandSignClassifier:
         return ascii_uppercase[ch1] if 0 <= ch1 < 26 else ""
 
 
+class NonManualMarkerDetector:
+    """Detects a small set of ASL non-manual markers using face landmarks."""
+
+    def __init__(self):
+        if not FACEMESH_AVAILABLE:
+            raise RuntimeError("Face mesh not available")
+        self.detector = FaceMeshDetector(maxFaces=1)
+        self.nose_positions = deque(maxlen=HEAD_MOVEMENT_WINDOW)
+        self.event_cooldown = 0
+        self.brow_eye_baseline = None
+
+    def _avg_point(self, pts, indices):
+        total_x = 0.0
+        total_y = 0.0
+        for idx in indices:
+            total_x += pts[idx][0]
+            total_y += pts[idx][1]
+        count = float(len(indices))
+        return total_x / count, total_y / count
+
+    def _update_brow_baseline(self, ratio):
+        if self.brow_eye_baseline is None:
+            self.brow_eye_baseline = ratio
+            return
+        if abs(ratio - self.brow_eye_baseline) < NMM_BROW_BASELINE_TOL:
+            self.brow_eye_baseline = (self.brow_eye_baseline * 0.9) + (ratio * 0.1)
+
+    def detect(self, frame):
+        if self.event_cooldown > 0:
+            self.event_cooldown -= 1
+
+        _, faces = self.detector.findFaceMesh(frame, draw=False)
+        if not faces:
+            self.nose_positions.clear()
+            return None
+
+        pts = faces[0]
+        xs = [pt[0] for pt in pts]
+        ys = [pt[1] for pt in pts]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        face_w = max_x - min_x
+        face_h = max_y - min_y
+        if face_w <= 0 or face_h <= 0:
+            return None
+
+        left_brow_idx = [70, 63, 105, 66, 107]
+        right_brow_idx = [336, 296, 334, 293, 300]
+        left_eye_top_idx = [159, 160]
+        right_eye_top_idx = [386, 387]
+        left_eye_bottom_idx = [145, 144]
+        right_eye_bottom_idx = [374, 373]
+
+        _, left_brow_y = self._avg_point(pts, left_brow_idx)
+        _, right_brow_y = self._avg_point(pts, right_brow_idx)
+        _, left_eye_top_y = self._avg_point(pts, left_eye_top_idx)
+        _, right_eye_top_y = self._avg_point(pts, right_eye_top_idx)
+        _, left_eye_bottom_y = self._avg_point(pts, left_eye_bottom_idx)
+        _, right_eye_bottom_y = self._avg_point(pts, right_eye_bottom_idx)
+
+        eye_height = (abs(left_eye_bottom_y - left_eye_top_y) + abs(right_eye_bottom_y - right_eye_top_y)) / 2.0
+        brow_eye_dist = ((left_eye_top_y - left_brow_y) + (right_eye_top_y - right_brow_y)) / 2.0
+        brow_eye_ratio = brow_eye_dist / max(eye_height, 1.0)
+        if brow_eye_ratio > 0:
+            self._update_brow_baseline(brow_eye_ratio)
+
+        brow_state = "neutral"
+        if self.brow_eye_baseline is not None:
+            if brow_eye_ratio > self.brow_eye_baseline * (1.0 + NMM_BROW_RAISE_DELTA):
+                brow_state = "raise"
+            elif brow_eye_ratio < self.brow_eye_baseline * (1.0 - NMM_BROW_FURROW_DELTA):
+                brow_state = "furrow"
+
+        mouth_open = abs(pts[13][1] - pts[14][1])
+        mouth_width = abs(pts[78][0] - pts[308][0])
+        mouth_ratio = mouth_open / max(mouth_width, 1.0)
+        mouth_state = "open" if mouth_ratio > NMM_MOUTH_OPEN_RATIO else "neutral"
+
+        left_eye = pts[33]
+        right_eye = pts[263]
+        eye_angle = math.degrees(math.atan2(right_eye[1] - left_eye[1], right_eye[0] - left_eye[0]))
+        if eye_angle > HEAD_TILT_DEG:
+            head_tilt = "right"
+        elif eye_angle < -HEAD_TILT_DEG:
+            head_tilt = "left"
+        else:
+            head_tilt = "neutral"
+
+        nose_tip = pts[1]
+        center_x = (min_x + max_x) / 2.0
+        center_y = (min_y + max_y) / 2.0
+        norm_x = (nose_tip[0] - center_x) / face_w
+        norm_y = (nose_tip[1] - center_y) / face_h
+        self.nose_positions.append((norm_x, norm_y))
+
+        head_shake = False
+        head_nod = False
+        if len(self.nose_positions) >= max(4, HEAD_MOVEMENT_WINDOW // 2):
+            xs = [p[0] for p in self.nose_positions]
+            ys = [p[1] for p in self.nose_positions]
+            range_x = max(xs) - min(xs)
+            range_y = max(ys) - min(ys)
+            if self.event_cooldown == 0:
+                if range_x > HEAD_SHAKE_THRESHOLD and range_x > range_y * 1.2:
+                    head_shake = True
+                    self.event_cooldown = HEAD_EVENT_COOLDOWN
+                elif range_y > HEAD_NOD_THRESHOLD and range_y > range_x * 1.2:
+                    head_nod = True
+                    self.event_cooldown = HEAD_EVENT_COOLDOWN
+
+        return {
+            "brow_state": brow_state,
+            "mouth_state": mouth_state,
+            "head_tilt": head_tilt,
+            "head_shake": head_shake,
+            "head_nod": head_nod,
+        }
+
+
 class SuggestionEngine:
     """Provides word suggestions."""
     
@@ -479,8 +623,16 @@ class SignLanguageApp:
         
         # TWO separate hand detectors (like original code)
         if CVZONE_AVAILABLE:
-            self.hd = HandDetector(maxHands=1, detectionCon=0.8)   # For full frame
-            self.hd2 = HandDetector(maxHands=1, detectionCon=0.8)  # For cropped image
+            self.hd = HandDetector(
+                maxHands=1,
+                detectionCon=HAND_DETECTION_CONFIDENCE,
+                minTrackCon=HAND_TRACKING_CONFIDENCE,
+            )  # For full frame
+            self.hd2 = HandDetector(
+                maxHands=1,
+                detectionCon=HAND_DETECTION_CONFIDENCE,
+                minTrackCon=HAND_TRACKING_CONFIDENCE,
+            )  # For cropped image
         else:
             self.hd = self.hd2 = None
         
@@ -497,7 +649,7 @@ class SignLanguageApp:
         
         # Text-to-speech (new threaded implementation)
         self.tts = TextToSpeech()
-        
+
         # State
         self.current_text = ""
         self.current_symbol = ""
@@ -506,6 +658,27 @@ class SignLanguageApp:
         self.blank_count = 0
         self.cooldown_counter = 0  # NEW: Cooldown after adding character
         self.pts = None
+
+        # Non-manual markers
+        self.nmm_detector = None
+        if CVZONE_AVAILABLE and FACEMESH_AVAILABLE:
+            try:
+                self.nmm_detector = NonManualMarkerDetector()
+            except Exception as e:
+                print(f"NMM detector error: {e}")
+        self.nmm_brow_state_raw = "neutral"
+        self.nmm_brow_state = "neutral"
+        self.nmm_brow_count = 0
+        self.nmm_mouth_state_raw = "neutral"
+        self.nmm_mouth_state = "neutral"
+        self.nmm_mouth_count = 0
+        self.nmm_head_tilt = "neutral"
+        self.nmm_missing_frames = 0
+        self.nmm_event_display = ""
+        self.nmm_event_display_frames = 0
+        self.active_nmm_tags = []
+        self.active_nmm_applied = False
+        self.pending_nmm_tags = []
         
         # Suggestions
         self.word1 = self.word2 = self.word3 = self.word4 = ""
@@ -528,10 +701,16 @@ class SignLanguageApp:
         
         self.panel_hand = tk.Label(self.root, bg='gray')
         self.panel_hand.place(x=700, y=120, width=400, height=400)
-        
+
         # Hand type indicator (Left/Right)
         self.label_hand_type = tk.Label(self.root, text="", font=("Courier", 14), fg='green')
         self.label_hand_type.place(x=700, y=95)
+
+        # Non-manual marker indicator
+        self.label_nmm = tk.Label(self.root, text="", font=("Courier", 12), fg='darkgreen')
+        self.label_nmm.place(x=700, y=70)
+        if not self.nmm_detector:
+            self.label_nmm.configure(text="NMM: unavailable")
         
         tk.Label(self.root, text="Character:", font=("Courier", 24, "bold")).place(x=50, y=580)
         self.label_char = tk.Label(self.root, text="", font=("Courier", 28, "bold"), fg='blue')
@@ -563,6 +742,43 @@ class SignLanguageApp:
                   command=self.speak_text).place(x=1000, y=685, width=120, height=45)
         tk.Button(self.root, text="Clear", font=("Courier", 18, "bold"), bg='#f44336', fg='white',
                   command=self.clear_text).place(x=1140, y=685, width=120, height=45)
+
+    def _extract_hands(self, hands_result):
+        if not hands_result:
+            return []
+        if isinstance(hands_result, tuple):
+            for item in hands_result:
+                if isinstance(item, list):
+                    return item
+                if isinstance(item, dict):
+                    return [item]
+            return []
+        if isinstance(hands_result, list):
+            return hands_result
+        if isinstance(hands_result, dict):
+            return [hands_result]
+        return []
+
+    def _select_hand(self, hands):
+        for hand in hands:
+            if isinstance(hand, dict) and 'bbox' in hand:
+                return hand
+        return None
+
+    def _landmarks_to_crop(self, lm_list, x1, y1, crop_w, flip_horizontal):
+        converted = []
+        for lm in lm_list:
+            x = lm[0] - x1
+            y = lm[1] - y1
+            if flip_horizontal:
+                x = crop_w - x
+            x = int(round(x))
+            y = int(round(y))
+            if len(lm) >= 3:
+                converted.append([x, y, lm[2]])
+            else:
+                converted.append([x, y])
+        return converted
     
     def _flip_landmarks_horizontal(self, pts, img_width):
         """Flip landmarks horizontally for left hand -> right hand conversion."""
@@ -588,6 +804,11 @@ class SignLanguageApp:
             
             # Display camera feed
             self._show_image(self.panel_camera, cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+            # Non-manual markers from face mesh
+            if self.nmm_detector:
+                markers = self.nmm_detector.detect(frame)
+                self._process_nmm(markers)
             
             # Decrement cooldown counter
             if self.cooldown_counter > 0:
@@ -598,15 +819,11 @@ class SignLanguageApp:
             
             if self.hd:
                 # Find hands in FULL frame using FIRST detector
-                hands = self.hd.findHands(frame, draw=False, flipType=True)
+                hands_raw = self.hd.findHands(frame, draw=False, flipType=True)
+                hands = self._extract_hands(hands_raw)
+                hand_info = self._select_hand(hands)
                 
-                # Handle cvzone return format
-                if isinstance(hands, tuple):
-                    hands = hands[0] if hands[0] else []
-                hands = hands or []
-                
-                if hands and 'bbox' in hands[0]:
-                    hand_info = hands[0]
+                if hand_info:
                     x, y, w, h = hand_info['bbox']
                     
                     # Check hand type - IMPORTANT: Because we flipped the frame for mirror display,
@@ -632,18 +849,31 @@ class SignLanguageApp:
                         if is_actual_left_hand:
                             hand_crop = cv2.flip(hand_crop, 1)  # Horizontal flip
                         
+                        crop_w = hand_crop.shape[1]
+                        pts = None
+                        if 'lmList' in hand_info and hand_info['lmList']:
+                            pts = self._landmarks_to_crop(
+                                hand_info['lmList'],
+                                x1,
+                                y1,
+                                crop_w,
+                                is_actual_left_hand,
+                            )
+                        
                         # Create white background
                         white = np.ones((WHITE_BG_SIZE, WHITE_BG_SIZE, 3), dtype=np.uint8) * 255
                         
-                        # Find landmarks in CROPPED image using SECOND detector
-                        handz = self.hd2.findHands(hand_crop, draw=False, flipType=True)
+                        if pts is None and self.hd2:
+                            # Find landmarks in CROPPED image using SECOND detector
+                            handz_raw = self.hd2.findHands(hand_crop, draw=False, flipType=True)
+                            handz = self._extract_hands(handz_raw)
+                            for item in handz:
+                                if isinstance(item, dict) and 'lmList' in item:
+                                    pts = item['lmList']
+                                    break
                         
-                        if isinstance(handz, tuple):
-                            handz = handz[0] if handz[0] else []
-                        handz = handz or []
-                        
-                        if handz and 'lmList' in handz[0]:
-                            self.pts = handz[0]['lmList']
+                        if pts:
+                            self.pts = pts
                             
                             # Calculate offset to center on white background
                             os_x = ((WHITE_BG_SIZE - w) // 2) - 15
@@ -746,9 +976,11 @@ class SignLanguageApp:
         """Handle no hand - add space."""
         # Sync from Entry in case user edited it manually
         self.current_text = self.sentence_var.get()
-        
+
+        self.current_text, _ = self._apply_pending_nmm_tags(self.current_text)
         if self.current_text and not self.current_text.endswith(" "):
             self.current_text += " "
+        if self.current_text:
             self.sentence_var.set(self.current_text)
             self._update_suggestions()
         
@@ -779,6 +1011,7 @@ class SignLanguageApp:
             else:
                 self.current_text = words[idx] + " "
             
+            self.current_text, _ = self._apply_pending_nmm_tags(self.current_text)
             self.sentence_var.set(self.current_text)
             self._update_suggestions()
             
@@ -801,10 +1034,110 @@ class SignLanguageApp:
         self.same_char_count = 0
         self.cooldown_counter = 0
         self.word1 = self.word2 = self.word3 = self.word4 = ""
+        self.active_nmm_tags = []
+        self.active_nmm_applied = False
+        self.pending_nmm_tags = []
         self.label_char.configure(text="")
         self.sentence_var.set("")
         self.label_status.configure(text="Ready", fg='green')
         self._update_suggestions()
+
+    def _apply_pending_nmm_tags(self, text):
+        tags_to_apply = []
+        if self.active_nmm_tags and not self.active_nmm_applied:
+            tags_to_apply.extend(self.active_nmm_tags)
+            self.active_nmm_applied = True
+        if self.pending_nmm_tags:
+            tags_to_apply.extend(self.pending_nmm_tags)
+            self.pending_nmm_tags = []
+        if not tags_to_apply:
+            return text, False
+        updated = text.rstrip(" ")
+        if updated:
+            updated += " "
+        updated += " ".join(f"[{tag}]" for tag in tags_to_apply)
+        updated += " "
+        return updated, True
+
+    def _process_nmm(self, markers):
+        if not markers:
+            self.nmm_missing_frames += 1
+            if self.nmm_missing_frames >= NMM_MISSING_RESET:
+                self.nmm_brow_state = "neutral"
+                self.nmm_brow_state_raw = "neutral"
+                self.nmm_brow_count = 0
+                self.nmm_mouth_state = "neutral"
+                self.nmm_mouth_state_raw = "neutral"
+                self.nmm_mouth_count = 0
+                self.nmm_head_tilt = "neutral"
+                self.active_nmm_tags = []
+                self.active_nmm_applied = False
+            self._update_nmm_label()
+            return
+
+        self.nmm_missing_frames = 0
+        brow_state = markers["brow_state"]
+        if brow_state == self.nmm_brow_state_raw:
+            self.nmm_brow_count += 1
+        else:
+            self.nmm_brow_state_raw = brow_state
+            self.nmm_brow_count = 1
+        if self.nmm_brow_count >= NMM_STABLE_FRAMES:
+            self.nmm_brow_state = brow_state
+
+        mouth_state = markers["mouth_state"]
+        if mouth_state == self.nmm_mouth_state_raw:
+            self.nmm_mouth_count += 1
+        else:
+            self.nmm_mouth_state_raw = mouth_state
+            self.nmm_mouth_count = 1
+        if self.nmm_mouth_count >= NMM_STABLE_FRAMES:
+            self.nmm_mouth_state = mouth_state
+
+        self.nmm_head_tilt = markers["head_tilt"]
+
+        new_active_tags = []
+        if self.nmm_brow_state == "raise":
+            new_active_tags.append("Q-YN")
+        elif self.nmm_brow_state == "furrow":
+            new_active_tags.append("Q-WH")
+        if self.nmm_mouth_state == "open":
+            new_active_tags.append("MOUTH-OPEN")
+        if new_active_tags != self.active_nmm_tags:
+            self.active_nmm_tags = new_active_tags
+            self.active_nmm_applied = False
+
+        if markers["head_shake"]:
+            self.pending_nmm_tags.append("NEG")
+            self.nmm_event_display = "HEAD_SHAKE"
+            self.nmm_event_display_frames = 10
+        if markers["head_nod"]:
+            self.pending_nmm_tags.append("AFFIRM")
+            self.nmm_event_display = "HEAD_NOD"
+            self.nmm_event_display_frames = 10
+
+        self._update_nmm_label()
+
+    def _update_nmm_label(self):
+        if not hasattr(self, "label_nmm"):
+            return
+        if not self.nmm_detector:
+            self.label_nmm.configure(text="NMM: unavailable")
+            return
+        parts = []
+        if self.nmm_brow_state == "raise":
+            parts.append("BROW_RAISE")
+        elif self.nmm_brow_state == "furrow":
+            parts.append("BROW_FURROW")
+        if self.nmm_mouth_state == "open":
+            parts.append("MOUTH_OPEN")
+        if self.nmm_head_tilt != "neutral":
+            parts.append(f"TILT_{self.nmm_head_tilt.upper()}")
+        if self.nmm_event_display_frames > 0:
+            parts.append(self.nmm_event_display)
+            self.nmm_event_display_frames -= 1
+        text = "NMM: " + (" ".join(parts) if parts else "neutral")
+        self.label_nmm.configure(text=text)
 
     def destructor(self):
         print("Closing Application...")
